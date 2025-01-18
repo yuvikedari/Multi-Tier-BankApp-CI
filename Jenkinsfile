@@ -1,26 +1,24 @@
 pipeline {
     agent any
-
-    environment {
-        // Define environment variables
-        SONARQUBE_SERVER = 'Sonar'    // Replace with your SonarQube server name in Jenkins
-        DOCKER_REGISTRY = 'yuvikedari' // Replace with your Docker registry
-        IMAGE_NAME = 'java-app'                 // Replace with your image name
-        IMAGE_TAG = 'latest'                    // Or dynamically use GIT_COMMIT for unique tagging
-    }
+        docker {
+          image 'abhishekf5/maven-abhishek-docker-agent:v1'
+          args '--user root -v /var/run/docker.sock:/var/run/docker.sock' // mount Docker socket to access the host's Docker daemon
+        }
+      }
 
     stages {
         stage('Code Fetch') {
             steps {
-                echo 'Fetching code from SCM...'
-                checkout scm
+                sh 'echo passed'
+                git branch: 'main', url: 'https://github.com/yuvikedari/Multi-Tier-BankApp-CI.git'
             }
         }
 
-        stage('Compile') {
+        stage('Build and Test') {
             steps {
-                echo 'Compiling the code...'
-                sh 'mvn compile'
+                sh 'ls -ltr'
+                // build the project and create a JAR file
+                sh 'cd Multi-Tier-BankApp-CI && mvn clean package'
             }
         }
 
@@ -31,70 +29,51 @@ pipeline {
             }
         }
 
-        stage('SonarQube Analysis') {
-            steps {
-                echo 'Performing SonarQube analysis...'
-                withSonarQubeEnv("${SONARQUBE_SERVER}") {
-                    sh 'mvn sonar:sonar'
+        stage('Static Code Analysis') {
+          environment {
+            SONAR_URL = "http://3.90.51.121:9000/"
+          }
+          steps {
+            withCredentials([string(credentialsId: 'sonarqube', variable: 'SONAR_AUTH_TOKEN')]) {
+              sh 'cd Multi-Tier-BankApp-CI && mvn sonar:sonar -Dsonar.login=$SONAR_AUTH_TOKEN -Dsonar.host.url=${SONAR_URL}'
+            }
+          }
+        }
+
+         stage('Build and Push Docker Image') {
+          environment {
+            DOCKER_IMAGE = "yuvikedari/my-bank-app:${BUILD_NUMBER}"
+            // DOCKERFILE_LOCATION = "java-maven-sonar-argocd-helm-k8s/spring-boot-app/Dockerfile"
+            REGISTRY_CREDENTIALS = credentials('docker-cred')
+          }
+          steps {
+            script {
+                sh 'cd Multi-Tier-BankApp-CI && docker build -t ${DOCKER_IMAGE} .'
+                def dockerImage = docker.image("${DOCKER_IMAGE}")
+                docker.withRegistry('https://index.docker.io/v1/', "docker-cred") {
+                dockerImage.push()
                 }
             }
+          }
         }
 
-        stage('Build Artifact') {
-            steps {
-                echo 'Building the artifact...'
-                sh 'mvn package'
-            }
-            post {
-                success {
-                    archiveArtifacts artifacts: '**/target/*.jar', fingerprint: true
-                }
-            }
+        
+        stage('Update Deployment File') {
+        environment {
+            GIT_REPO_NAME = "Multi-Tier-BankApp-CD"
+            GIT_USER_NAME = "yuvikedari"
         }
-
-        stage('Build Docker Image') {
-            steps {
-                echo 'Building Docker image...'
-                sh """
-                    docker build -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} .
-                """
-            }
-        }
-
-        stage('Scan Docker Image') {
-            steps {
-                echo 'Scanning Docker image...'
-                // Example: Using Trivy for image scanning
-                sh """
-                    trivy image ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
-                """
-            }
-        }
-
-        stage('Push Docker Image') {
-            steps {
-                echo 'Pushing Docker image to registry...'
-                withDockerRegistry([credentialsId: 'docker-credentials', url: "https://${DOCKER_REGISTRY}"]) {
-                    sh """
-                        docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
-                    """
-                }
-            }
-        }
-
-        stage('Update Manifest File') {
-            steps {
-                echo 'Updating manifest file...'
-                // Replace this block with the actual logic to update the manifest file
-                sh """
-                    echo "image: ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}" > updated-manifest.yaml
-                    # Commit and push the updated manifest to another repo
-                    git config user.name "jenkins"
-                    git config user.email "jenkins@yourdomain.com"
-                    git add updated-manifest.yaml
-                    git commit -m "Updated manifest with new image: ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
-                    git push origin main
-                """
+        steps {
+            withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+                sh '''
+                    git config user.email "yuvikedari@gmail.com"
+                    git config user.name "Yuvi Kedari"
+                    BUILD_NUMBER=${BUILD_NUMBER}
+                    sed -i "s/replaceImageTag/${BUILD_NUMBER}/g" /deployment.yml
+                    git add Multi-Tier-BankApp-CD/bankapp/bankapp-ds.yml
+                    git commit -m "Update deployment image to version ${BUILD_NUMBER}"
+                    git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:main
+                '''
             }
         }
     }
